@@ -7,7 +7,7 @@ __pycache__/
 # Logs
 logs/*.log
 
-# Certificados (NUNCA subir claves privadas)
+# Certificados
 certs/*.key
 certs/*.csr
 
