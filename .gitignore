@@ -1,0 +1,29 @@
+# Entorno virtual
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/*.log
+
+# Certificados (NUNCA subir claves privadas)
+certs/*.key
+certs/*.csr
+
+# Archivos de prueba con datos reales
+*.mt940.enc
+
+# Archivos temporales
+*.tmp
+*.bak
+
+# Carpetas de trabajo (mantener las carpetas pero no su contenido)
+carpetas/entrada/*
+carpetas/procesados/*
+carpetas/errores/*
+
+# Excepciones: mantener las carpetas vacías
+!carpetas/entrada/.gitkeep
+!carpetas/procesados/.gitkeep
+!carpetas/errores/.gitkeep

@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import time
+import logging
+import json
+import shutil
+import signal
+import socket
+import ssl
+import threading
+from datetime import datetime
+from pathlib import Path
+import configparser
+from daemon import DaemonContext
+import mt940
+from mt940 import MT940
+
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('DemonioMT940')
+
+class DemonioMT940:
+    def __init__(self, config_file='config.ini'):
+        self.config_file = config_file
+        self.cargar_configuracion()
+        self.running = True
+        self.ssl_context = None
+        self.setup_ssl()
+        
+        signal.signal(signal.SIGTERM, self.manejar_senal)
+        signal.signal(signal.SIGINT, self.manejar_senal)
+        logger.info("Demonio inicializado correctamente")
+    
+    def cargar_configuracion(self):
+        try:
+            config = configparser.ConfigParser()
+            config.read(self.config_file)
+            
+            self.carpeta_entrada = config['general']['carpeta_entrada']
+            self.carpeta_procesados = config['general']['carpeta_procesados']
+            self.carpeta_errores = config['general']['carpeta_errores']
+            self.intervalo_escaneo = int(config['general']['intervalo_escaneo'])
+            self.log_file = config['general']['log_file']
+            
+            self.cert_file = config['ssl']['cert_file']
+            self.key_file = config['ssl']['key_file']
+            self.ca_file = config['ssl']['ca_file']
+            
+            carpetas_a_crear = [
+                self.carpeta_entrada, 
+                self.carpeta_procesados, 
+                self.carpeta_errores,
+                os.path.dirname(self.log_file)
+            ]
+            
+            for carpeta in carpetas_a_crear:
+                Path(carpeta).mkdir(parents=True, exist_ok=True)
+                
+            logger.info(f"Configuración cargada correctamente")
+            logger.info(f"Carpeta de entrada: {self.carpeta_entrada}")
+            logger.info(f"Carpeta de procesados: {self.carpeta_procesados}")
+            logger.info(f"Carpeta de errores: {self.carpeta_errores}")
+            
+        except Exception as e:
+            logger.error(f"Error cargando configuración: {e}")
+            sys.exit(1)
+    
+    def setup_ssl(self):
+        try:
+            self.ssl_context = ssl.create_default_context(
+                ssl.Purpose.CLIENT_AUTH,
+                cafile=self.ca_file
+            )
+            self.ssl_context.load_cert_chain(
+                certfile=self.cert_file,
+                keyfile=self.key_file
+            )
+            self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM')
+            logger.info("Contexto SSL configurado correctamente")
+        except Exception as e:
+            logger.error(f"Error configurando SSL: {e}")
+            self.ssl_context = None
+    
+    def manejar_senal(self, signum, frame):
+        logger.info(f"Señal {signum} recibida. Cerrando demonio...")
+        self.running = False
+    
+    def procesar_archivo_mt940(self, archivo_path):
+        try:
+            logger.info(f"Procesando archivo: {archivo_path}")
+            
+            with open(archivo_path, 'r', encoding='utf-8') as f:
+                contenido = f.read()
+            
+            parser = MT940(name='mt940')
+            transacciones = parser.parse(contenido)
+            
+            datos_extraidos = {
+                'archivo': os.path.basename(archivo_path),
+                'fecha_procesamiento': datetime.now().isoformat(),
+                'transacciones': [],
+                'resumen': {
+                    'total_transacciones': len(transacciones),
+                    'total_debito': 0.0,
+                    'total_credito': 0.0
+                }
+            }
+            
+            for transaccion in transacciones:
+                monto = float(transaccion.parsed_data.get('amount', 0))
+                
+                datos_transaccion = {
+                    'fecha': transaccion.parsed_data.get('date', ''),
+                    'monto': monto,
+                    'descripcion': transaccion.parsed_data.get('description', ''),
+                    'referencia': transaccion.parsed_data.get('reference', ''),
+                    'tipo': 'CREDITO' if monto > 0 else 'DEBITO'
+                }
+                
+                if datos_transaccion['tipo'] == 'CREDITO':
+                    datos_extraidos['resumen']['total_credito'] += monto
+                else:
+                    datos_extraidos['resumen']['total_debito'] += abs(monto)
+                
+                datos_extraidos['transacciones'].append(datos_transaccion)
+            
+            nombre_json = f"{os.path.splitext(os.path.basename(archivo_path))[0]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            json_path = os.path.join(self.carpeta_procesados, nombre_json)
+            
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(datos_extraidos, f, indent=2, ensure_ascii=False)
+            
+            archivo_procesado = os.path.join(self.carpeta_procesados, os.path.basename(archivo_path))
+            shutil.move(archivo_path, archivo_procesado)
+            
+            logger.info(f"Archivo procesado correctamente: {archivo_path}")
+            logger.info(f"Se encontraron {len(transacciones)} transacciones")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error procesando {archivo_path}: {e}")
+            archivo_error = os.path.join(self.carpeta_errores, os.path.basename(archivo_path))
+            shutil.move(archivo_path, archivo_error)
+            return False
+    
+    def escanear_carpeta(self):
+        try:
+            archivos = os.listdir(self.carpeta_entrada)
+            archivos_mt940 = [f for f in archivos if f.lower().endswith(('.mt940', '.sta', '.txt'))]
+            
+            for archivo in archivos_mt940:
+                archivo_path = os.path.join(self.carpeta_entrada, archivo)
+                self.procesar_archivo_mt940(archivo_path)
+                
+        except Exception as e:
+            logger.error(f"Error escaneando carpeta: {e}")
+    
+    def iniciar_servidor_ssl(self):
+        try:
+            if not self.ssl_context:
+                logger.warning("SSL no disponible. Servidor no iniciado.")
+                return
+            
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind(('0.0.0.0', 8443))
+            server_socket.listen(5)
+            
+            logger.info("Servidor SSL iniciado en puerto 8443")
+            
+            while self.running:
+                try:
+                    client_socket, addr = server_socket.accept()
+                    ssl_socket = self.ssl_context.wrap_socket(
+                        client_socket, 
+                        server_side=True
+                    )
+                    threading.Thread(target=self.manejar_conexion_ssl, 
+                                   args=(ssl_socket, addr)).start()
+                except ssl.SSLError as e:
+                    logger.error(f"Error SSL: {e}")
+                except Exception as e:
+                    if self.running:
+                        logger.error(f"Error en servidor: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error iniciando servidor SSL: {e}")
+    
+    def manejar_conexion_ssl(self, ssl_socket, addr):
+        try:
+            logger.info(f"Manejando conexión SSL desde {addr}")
+            
+            data = ssl_socket.recv(4096).decode('utf-8')
+            if not data:
+                return
+            
+            nombre_archivo = f"recibido_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mt940"
+            archivo_path = os.path.join(self.carpeta_entrada, nombre_archivo)
+            
+            with open(archivo_path, 'w', encoding='utf-8') as f:
+                f.write(data)
+            
+            exito = self.procesar_archivo_mt940(archivo_path)
+            
+            if exito:
+                respuesta = "Archivo recibido y procesado correctamente"
+            else:
+                respuesta = "Error al procesar el archivo"
+            
+            ssl_socket.sendall(respuesta.encode('utf-8'))
+            
+        except Exception as e:
+            logger.error(f"Error manejando conexión SSL desde {addr}: {e}")
+            try:
+                ssl_socket.sendall(f"Error: {str(e)}".encode('utf-8'))
+            except:
+                pass
+        finally:
+            ssl_socket.close()
+    
+    def ejecutar(self):
+        logger.info("=" * 60)
+        logger.info("DEMONIO MT940 INICIADO")
+        logger.info(f"Hora de inicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("=" * 60)
+        
+        hilo_ssl = threading.Thread(target=self.iniciar_servidor_ssl)
+        hilo_ssl.daemon = True
+        hilo_ssl.start()
+        
+        contador = 0
+        while self.running:
+            try:
+                contador += 1
+                logger.info(f"--- Escaneo #{contador} ---")
+                self.escanear_carpeta()
+                
+                for _ in range(self.intervalo_escaneo):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Error en loop principal: {e}")
+                time.sleep(5)
+        
+        logger.info("=" * 60)
+        logger.info("DEMONIO MT940 TERMINADO")
+        logger.info(f"Hora de finalización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info("=" * 60)
+
+def main():
+    contexto = DaemonContext(
+        working_directory='.',
+        umask=0o002,
+        pidfile=None
+    )
+    
+    demonio = DemonioMT940()
+    
+    with contexto:
+        demonio.ejecutar()
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == '--no-daemon':
+        print("Ejecutando en modo prueba (primer plano)...")
+        demonio = DemonioMT940()
+        demonio.ejecutar()
+    else:
+        print("Iniciando demonio... (usa --no-daemon para pruebas)")
+        main()

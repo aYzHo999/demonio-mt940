@@ -1,0 +1,11 @@
+[general]
+carpeta_entrada = ./carpetas/entrada
+carpeta_procesados = ./carpetas/procesados
+carpeta_errores = ./carpetas/errores
+log_file = ./logs/demonio_mt940.log
+intervalo_escaneo = 30
+
+[ssl]
+cert_file = ./certs/server.crt
+key_file = ./certs/server.key
+ca_file = ./certs/ca.crt
